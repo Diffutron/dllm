@@ -341,7 +341,6 @@ class BERTEvalHarness(LM):
             generated_answer = self.tokenizer.decode(
                 generated_ids[0][prompt[0].shape[0] :], skip_special_tokens=False
             )
-            breakpoint()
             for stop_seq in stop_tokens:
                 if stop_seq in generated_answer:
                     generated_answer = generated_answer.split(stop_seq)[0]
