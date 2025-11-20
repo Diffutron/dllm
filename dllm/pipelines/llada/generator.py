@@ -10,11 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from dllm.utils.generation_utils import get_num_transfer_tokens
-from dllm.core.generation.generator import (
-    GeneratorOutput,
-    GeneratorConfig,
-    BaseGenerator,
-)
+from dllm.core.generation.generator import GeneratorOutput, GeneratorConfig, BaseGenerator
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -31,12 +27,67 @@ def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return logits.exp() / gumbel_noise
 
 
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    sequences: torch.Tensor,
+    penalty: float = 1.2,
+    mask_token_id: int | None = None,
+    eos_token_id: int | None = None,
+) -> torch.Tensor:
+    """
+    Apply repetition penalty to logits in place (returns logits).
+    """
+    if penalty == 1.0:
+        return logits
+
+    device = logits.device
+    B = sequences.shape[0]
+
+    if logits.ndim == 3:
+        # [B, T_logits, V]
+        T_logits = logits.shape[1]
+        V = logits.shape[2]
+        for b in range(B):
+            seq = sequences[b]
+            uniq = torch.unique(seq)
+            if mask_token_id is not None:
+                uniq = uniq[uniq != mask_token_id]
+            if eos_token_id is not None:
+                uniq = uniq[uniq != eos_token_id]
+            if uniq.numel() == 0:
+                continue
+            uniq = uniq.to(device=device, dtype=torch.long)
+            slice_b = logits[b, :, uniq]
+            pos_mask = slice_b > 0
+            slice_b = torch.where(pos_mask, slice_b / penalty, slice_b * penalty)
+            logits[b, :, uniq] = slice_b
+    elif logits.ndim == 2:
+        # [B, V]
+        V = logits.shape[1]
+        for b in range(B):
+            seq = sequences[b]
+            uniq = torch.unique(seq)
+            if mask_token_id is not None:
+                uniq = uniq[uniq != mask_token_id]
+            if eos_token_id is not None:
+                uniq = uniq[uniq != eos_token_id]
+            if uniq.numel() == 0:
+                continue
+            uniq = uniq.to(device=device, dtype=torch.long)
+            slice_b = logits[b, uniq]
+            pos_mask = slice_b > 0
+            slice_b = torch.where(pos_mask, slice_b / penalty, slice_b * penalty)
+            logits[b, uniq] = slice_b
+    else:
+        raise ValueError(f"Unexpected logits.ndim={logits.ndim}")
+
+    return logits
+
+
 @dataclass
 class LLaDAGeneratorConfig(GeneratorConfig):
     max_new_tokens: int = 128
-    max_length: int = (
-        None  # There's no explicit length_limit except for the tokenizer/model context
-    )
+    max_length: int = None
     block_length: int = 128
     steps: int = 128
     temperature: float = 0.0
@@ -44,21 +95,89 @@ class LLaDAGeneratorConfig(GeneratorConfig):
     stochastic_transfer: bool = False
     cfg_scale: float = 0.0
     cfg_keep_tokens: list[int] | None = None
+    repetition_penalty: float = 1.2
 
 
 @dataclass
 class LLaDAGenerator(BaseGenerator):
+    
+    def _apply_stop_criteria(self, x: torch.Tensor):
+        """
+        Custom Logic:
+        Checks for specific stop strings/tokens. If found:
+        1. Replaces the stop sequence start with "\n[/Answer]\n".
+        2. Replaces all remaining positions after that with <pad>.
+        """
+        stop_strings = ["|USER|>", "<|USER|>", "<s>", "</s>"]
+        target_str = "\n[/Answer]\n"
+        
+        # Prepare replacement tokens
+        replacement_ids = self.tokenizer.encode(target_str, add_special_tokens=False)
+        replacement_tensor = torch.tensor(replacement_ids, device=x.device, dtype=torch.long)
+        len_repl = len(replacement_ids)
+        
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        
+        B = x.shape[0]
+        # Decode with special tokens initially to ensure we capture structure, then rely on string matching
+        decoded_texts = self.tokenizer.batch_decode(x, skip_special_tokens=False)
+
+        for b in range(B):
+            current_text = decoded_texts[b]
+            
+            found_stop = None
+            min_idx = float('inf')
+            
+            for s in stop_strings:
+                idx = current_text.find(s)
+                if idx != -1 and idx < min_idx:
+                    min_idx = idx
+                    found_stop = s
+            
+            if found_stop is not None:
+                # Calculate token index corresponding to min_idx
+                prefix_text = current_text[:min_idx]
+                
+                # Encode prefix to count tokens
+                # Note: add_special_tokens=False is crucial to prevent double BOS counting
+                prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+                token_idx = len(prefix_ids)
+                
+                # --- FIX: BOS Offset Correction ---
+                # If the actual tensor x starts with a BOS token (which is standard for many models),
+                # but encode(prefix, add_special_tokens=False) does not produce it,
+                # our token_idx will be 1 short (pointing to the previous token).
+                if x.shape[1] > 0 and self.tokenizer.bos_token_id is not None:
+                    if x[b, 0] == self.tokenizer.bos_token_id:
+                        # Check if prefix_ids already included BOS (unlikely with add_special_tokens=False)
+                        if len(prefix_ids) == 0 or prefix_ids[0] != self.tokenizer.bos_token_id:
+                            token_idx += 1
+                # ----------------------------------
+
+                if token_idx < x.shape[1]:
+                    start = token_idx
+                    end = start + len_repl
+                    valid_end = min(end, x.shape[1])
+                    len_to_copy = valid_end - start
+                    
+                    # 1. Insert replacement text
+                    if len_to_copy > 0:
+                        x[b, start:valid_end] = replacement_tensor[:len_to_copy]
+                    
+                    # 2. Fill remainder with PAD (stops generation for this sample)
+                    if valid_end < x.shape[1]:
+                        x[b, valid_end:] = pad_id
+
     @torch.no_grad()
     def generate(
         self,
         inputs: list[torch.Tensor | list],
         config: LLaDAGeneratorConfig | None = None,
-        **kwargs,
+        **kwargs
     ) -> GeneratorOutput | torch.Tensor:
         if config is None:
             config = LLaDAGeneratorConfig()
 
-        # ----- pull args from config, allow kwargs to override -----
         steps = kwargs.get("steps", config.steps)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
         max_length = kwargs.get("max_length", config.max_length)
@@ -67,19 +186,15 @@ class LLaDAGenerator(BaseGenerator):
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
         cfg_keep_tokens = kwargs.get("cfg_keep_tokens", config.cfg_keep_tokens)
         remasking = kwargs.get("remasking", config.remasking)
-        stochastic_transfer = kwargs.get(
-            "stochastic_transfer", config.stochastic_transfer
-        )
-        return_dict_in_generate = kwargs.get(
-            "return_dict_in_generate", config.return_dict_in_generate
-        )
+        stochastic_transfer = kwargs.get("stochastic_transfer", config.stochastic_transfer)
+        return_dict_in_generate = kwargs.get("return_dict_in_generate", config.return_dict_in_generate)
+        repetition_penalty = kwargs.get("repetition_penalty", config.repetition_penalty)
 
         assert 1 <= block_length
         assert 1 <= steps
         mask_id = self.tokenizer.mask_token_id
         eos_id = self.tokenizer.eos_token_id
 
-        # ----- Shape bookkeeping: per-sample prompt lengths and final canvas width -----
         if isinstance(inputs[0], list):
             inputs = [
                 torch.as_tensor(p, dtype=torch.long, device=self.model.device)
@@ -95,46 +210,31 @@ class LLaDAGenerator(BaseGenerator):
         B = len(inputs)
         T = max_length
 
-        # ----- Initialize canvas with EOS, copy inputs, and append mask tail -----
         x = torch.full((B, T), eos_id, dtype=torch.long, device=self.model.device)
         for i, p in enumerate(inputs):
-            x[i, : prompt_lens[i]] = p  # keep original prompt tokens
-            x[i, prompt_lens[i] : prompt_lens[i] + max_new_tokens] = (
-                mask_id  # append `max_new_tokens` masks to be generated
-            )
+            x[i, : prompt_lens[i]] = p
+            x[i, prompt_lens[i] : prompt_lens[i] + max_new_tokens] = mask_id
         attention_mask = (x != eos_id).long() if B > 1 else None
 
-        # Tokens that were *given* at the start (non-mask, non-EOS).
-        # These will be masked in the unconditional forward pass for CFG.
-        # Tokens from `cfg_keep_tokens` should *not* be treated as "given" for CFG
         unmasked_index = (x != mask_id) & (x != eos_id)
         if not (cfg_keep_tokens is None or len(cfg_keep_tokens) == 0):
-            keep_mask = torch.isin(
-                x, torch.as_tensor(cfg_keep_tokens, device=self.model.device)
-            )
+            keep_mask = torch.isin(x, torch.as_tensor(cfg_keep_tokens, device=self.model.device))
             unmasked_index = unmasked_index & ~keep_mask
 
-        # ----- Block scheduling over the appended mask tail -----
         num_blocks = math.ceil(max_new_tokens / block_length)
-        steps = math.ceil(steps / num_blocks)  # per-block step budget
+        steps = math.ceil(steps / num_blocks)
         histories = [x.clone()] if return_dict_in_generate else None
 
         for b in range(num_blocks):
-            # Build a per-sample mask *within this block* (aligned to each prompt's tail)
-            block_mask_index = torch.zeros(
-                (B, block_length), dtype=torch.bool, device=x.device
-            )
+            block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x.device)
 
             for j in range(B):
                 start = prompt_lens[j] + b * block_length
                 end = min(start + block_length, prompt_lens[j] + max_new_tokens, T)
                 if start < end:
                     width = end - start
-                    block_mask_index[j, :width] = (
-                        x[j, start:end] == mask_id
-                    )  # which positions in this block are still masked
+                    block_mask_index[j, :width] = x[j, start:end] == mask_id
 
-            # Decide how many tokens to reveal per step in this block
             num_transfer_tokens = get_num_transfer_tokens(
                 mask_index=block_mask_index,
                 steps=steps,
@@ -142,73 +242,65 @@ class LLaDAGenerator(BaseGenerator):
                 stochastic=stochastic_transfer,
             )
 
-            # Some steps may be skipped if there are no transfers
             effective_steps = num_transfer_tokens.size(1)
 
-            # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
-                mask_index = x == mask_id  # current global mask map
+                # --- Optimization: Break if no masks left in the entire batch ---
+                if not torch.any(x == mask_id):
+                    break
+                
+                mask_index = x == mask_id
 
-                # Optional CFG: second forward where original prompt tokens are masked out
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits = self.model(x_, attention_mask=attention_mask).logits
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits = self.model(x, attention_mask=attention_mask).logits
 
-                # Argmax decoding with optional Gumbel-Max noise for exploration
+                logits = apply_repetition_penalty(
+                    logits, x, penalty=repetition_penalty, mask_token_id=mask_id, eos_token_id=eos_id
+                )
+
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(
-                    logits_with_noise, dim=-1
-                )  # [B, T] predicted token ids
+                x0 = torch.argmax(logits_with_noise, dim=-1)
 
-                # Per-position confidence used to pick which masks to commit this step
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-                    )  # [B, T] confidence of predicted token
+                    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
                 elif remasking == "random":
-                    x0_p = torch.rand(
-                        (x0.shape[0], x0.shape[1]), device=x0.device
-                    )  # random scores
+                    x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                # Restrict selection window to the *current block's* tail region
                 for j in range(B):
                     x0_p[j, prompt_lens[j] + (b + 1) * block_length :] = -np.inf
 
-                # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(
-                    mask_index, x0_p, -np.inf
-                )  # consider masked positions only
+                confidence = torch.where(mask_index, x0_p, -np.inf)
 
-                # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
-                transfer_index = torch.zeros_like(
-                    x0, dtype=torch.bool, device=x0.device
-                )
+                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                 for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(
-                        confidence[j], k=num_transfer_tokens[j, i]
-                    )
-                    transfer_index[j, select_index] = True
+                    k = int(num_transfer_tokens[j, i].item())
+                    masks_left = (x[j] == mask_id).sum().item()
+                    k = min(k, masks_left)
+                    
+                    if k > 0:
+                        _, select_index = torch.topk(confidence[j], k=k)
+                        transfer_index[j, select_index] = True
 
-                # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
+
+                # ----- CHECK STOP CRITERIA -----
+                self._apply_stop_criteria(x)
+                # -------------------------------
+
                 if histories is not None:
                     histories.append(x.clone())
 
-        # ----- Output format -----
         if not return_dict_in_generate:
             return x
         else:
@@ -216,20 +308,11 @@ class LLaDAGenerator(BaseGenerator):
 
     @torch.no_grad()
     def infill(
-        self, inputs: list[torch.Tensor | list], config, **kwargs
+        self,
+        inputs: list[torch.Tensor | list],
+        config,
+        **kwargs
     ) -> GeneratorOutput | torch.Tensor:
-        """
-        Fill in-place the <|mdm_mask|> tokens contained in `inputs`.
-        The whole (padded) sequence is split into block windows of length
-        `block_length`; within each window we progressively "unmask" positions
-        according to the scheduler and chosen remasking strategy.
-
-        Notes:
-        - Right padding uses EOS.
-        - CFG masks out *originally known* (non-mask, non-EOS) tokens in the
-        unconditional branch, identical to `generate`.
-        - Only masked positions are ever updated; non-mask tokens are left intact.
-        """
         # ----- pull args from config, allow kwargs to override -----
         steps = kwargs.get("steps", config.steps)
         block_length = kwargs.get("block_length", config.block_length)
@@ -237,17 +320,13 @@ class LLaDAGenerator(BaseGenerator):
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
         cfg_keep_tokens = kwargs.get("cfg_keep_tokens", config.cfg_keep_tokens)
         remasking = kwargs.get("remasking", config.remasking)
-        stochastic_transfer = kwargs.get(
-            "stochastic_transfer", config.stochastic_transfer
-        )
-        return_dict_in_generate = kwargs.get(
-            "return_dict_in_generate", config.return_dict_in_generate
-        )
+        stochastic_transfer = kwargs.get("stochastic_transfer", config.stochastic_transfer)
+        return_dict_in_generate = kwargs.get("return_dict_in_generate", config.return_dict_in_generate)
+        repetition_penalty = kwargs.get("repetition_penalty", config.repetition_penalty)
 
         mask_id = self.tokenizer.mask_token_id
         eos_id = self.tokenizer.eos_token_id
 
-        # ----- Build canvas: right-pad with EOS to the max length in the batch -----
         if isinstance(inputs[0], list):
             inputs = [
                 torch.as_tensor(p, dtype=torch.long, device=self.model.device)
@@ -258,7 +337,6 @@ class LLaDAGenerator(BaseGenerator):
         seq_lens = [t.shape[0] for t in inputs]
         T = max(seq_lens)
 
-        # Default to a single block spanning the whole sequence
         if block_length is None:
             block_length = T
 
@@ -270,41 +348,31 @@ class LLaDAGenerator(BaseGenerator):
             x[i, : seq_lens[i]] = t
         attention_mask = (x != eos_id).long() if B > 1 else None
 
-        # Tokens that were *given* at the start (non-mask, non-EOS).
-        # These will be masked in the unconditional forward pass for CFG.
-        # Tokens from `cfg_keep_tokens` should *not* be treated as "given" for CFG
         unmasked_index = (x != mask_id) & (x != eos_id)
         if not (cfg_keep_tokens is None or len(cfg_keep_tokens) == 0):
-            keep_mask = torch.isin(
-                x, torch.as_tensor(cfg_keep_tokens, device=self.model.device)
-            )
+            keep_mask = torch.isin(x, torch.as_tensor(cfg_keep_tokens, device=self.model.device))
             unmasked_index = unmasked_index & ~keep_mask
 
-        # ----- Blockwise schedule over the *entire* (padded) sequence -----
         num_blocks = math.ceil(T / block_length)
         steps_per_block = math.ceil(steps / num_blocks)
         histories = [x.clone()] if return_dict_in_generate else None
 
-        # Create attention mask where eos_token_id is masked (set to 0)
         attention_mask = (x != eos_id).long()
 
         for b in range(num_blocks):
             start = b * block_length
             stop = min(start + block_length, T)
 
-            # Per-sample view of which positions in this block are masks
             block_mask_index = torch.zeros(
                 (B, block_length), dtype=torch.bool, device=self.model.device
             )
             widths = []
             for j in range(B):
-                # Width limited by sample's true length and sequence end
                 width = max(0, min(seq_lens[j], stop) - start)
                 widths.append(width)
                 if width > 0:
                     block_mask_index[j, :width] = x[j, start : start + width] == mask_id
 
-            # Decide how many tokens to reveal at each step in this block
             num_transfer_tokens = get_num_transfer_tokens(
                 mask_index=block_mask_index,
                 steps=steps_per_block,
@@ -312,67 +380,67 @@ class LLaDAGenerator(BaseGenerator):
                 stochastic=stochastic_transfer,
             )
 
-            # Some blocks may have no masks => effective_steps == 0
             effective_steps = num_transfer_tokens.size(1)
 
             for s in range(effective_steps):
+                # --- Optimization: Break if no masks left in the entire batch ---
+                if not torch.any(x == mask_id):
+                    break
+                
                 mask_index_full = x == mask_id
 
-                # ----- Forward pass (+ optional CFG) -----
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits = self.model(x_, attention_mask=attention_mask).logits
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits = self.model(x, attention_mask=attention_mask).logits
 
-                # Greedy with optional Gumbel-Max noise
+                logits = apply_repetition_penalty(
+                    logits, x, penalty=repetition_penalty, mask_token_id=mask_id, eos_token_id=eos_id
+                )
+
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)  # [B, T]
+                x0 = torch.argmax(logits_with_noise, dim=-1)
 
-                # Confidence used for choosing which masks to commit this step
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
-                    x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(
-                        -1
-                    )  # [B, T]
+                    x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
                 elif remasking == "random":
                     x0_p = torch.rand((B, T), device=self.model.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                # Restrict selection to the *current* block only
                 for j in range(B):
                     end_j = start + widths[j]
-                    # Outside current block => impossible to select
                     x0_p[j, :start] = -np.inf
                     x0_p[j, end_j:] = -np.inf
 
-                # Only consider currently-masked positions as candidates
                 x0 = torch.where(mask_index_full, x0, x)
                 confidence = torch.where(mask_index_full, x0_p, -np.inf)
 
-                # Pick exactly num_transfer_tokens[j, s] positions per sample
                 transfer_index = torch.zeros_like(x, dtype=torch.bool)
                 for j in range(B):
                     k = int(num_transfer_tokens[j, s].item())
+                    masks_left = (x[j] == mask_id).sum().item()
+                    k = min(k, masks_left)
+
                     if k > 0:
                         _, select_idx = torch.topk(confidence[j], k=k)
                         transfer_index[j, select_idx] = True
 
-                # Commit selected predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
+
+                # ----- CHECK STOP CRITERIA -----
+                self._apply_stop_criteria(x)
+                # -------------------------------
+                
                 if histories is not None:
                     histories.append(x.clone())
 
-        # ----- Output format -----
         if not return_dict_in_generate:
             return x
         else:
