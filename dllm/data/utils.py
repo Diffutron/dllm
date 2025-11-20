@@ -40,7 +40,7 @@ def load_sft_dataset(
             logger.info("Load preprocessed data from disk.")
             ds = load_from_disk(dataset_name_or_path)
         # Implement your customized dataset here
-        elif _match(dataset_name_or_path, "tatsu-lab/alpaca"):
+        elif _match(dataset_name_or_path, "metunlp/LlamaTurk-Instruction-Set"):
             ds = load_dataset_alpaca(dataset_name_or_path)
         elif _match(dataset_name_or_path, "allenai/tulu-3-sft-mixture"):
             ds = load_dataset(dataset_name_or_path)
